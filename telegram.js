@@ -29,6 +29,21 @@ async function sendMessage(text, options = {}) {
 }
 
 /**
+ * Escape special Markdown characters in user-generated text
+ */
+function escapeMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/\*/g, '\\*')
+    .replace(/_/g, '\\_')
+    .replace(/`/g, '\\`')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+}
+
+/**
  * Send a missile alert
  * @param {object} alert - Alert data
  */
@@ -44,6 +59,7 @@ async function sendAlert(alert) {
   });
 
   const keywordList = alert.matched.map(k => `\`${k}\``).join(', ');
+  const safeText = escapeMarkdown(alert.text);
 
   const message = [
     `🚀 *התראת טילים / Missile Alert*`,
@@ -52,7 +68,7 @@ async function sendAlert(alert) {
     `🕐 *זמן:* ${timestamp}`,
     ``,
     `📝 *תוכן:*`,
-    alert.text,
+    safeText,
     ``,
     `🔑 *מילות מפתח:* ${keywordList}`,
     ``,

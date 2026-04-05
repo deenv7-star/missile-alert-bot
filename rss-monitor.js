@@ -1,15 +1,8 @@
-const RSSParser = require('rss-parser');
+const https = require('https');
 const config = require('./config');
 const { filterText } = require('./keyword-filter');
 const { hasSeen, markSeen } = require('./dedup');
 const { sendAlert } = require('./telegram');
-
-const parser = new RSSParser({
-  timeout: 15000,
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  },
-});
 
 // Stats tracking
 const stats = {
@@ -20,56 +13,75 @@ const stats = {
   perAccount: {},
 };
 
+// Cache user IDs to avoid repeated lookups
+const userIdCache = {};
+
 /**
- * Get RSS feed URL for an account
+ * Make an authenticated request to X API v2
  */
-function getFeedUrl(account, useFallback = false) {
-  if (useFallback) {
-    return config.rss.fallbackBase.replace('{account}', account);
-  }
-  return `${config.rss.baseUrl}${account}`;
+function xApiRequest(path) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.x.com',
+      path,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${config.twitter.bearerToken}`,
+        'User-Agent': 'MissileAlertBot/1.0',
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (res.statusCode === 200) {
+            resolve(parsed);
+          } else {
+            reject(new Error(`X API ${res.statusCode}: ${parsed.detail || parsed.title || JSON.stringify(parsed)}`));
+          }
+        } catch (e) {
+          reject(new Error(`X API parse error: ${e.message}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(15000, () => {
+      req.destroy();
+      reject(new Error('X API request timeout'));
+    });
+    req.end();
+  });
 }
 
 /**
- * Fetch RSS feed with retry logic
+ * Get user ID from username
  */
-async function fetchFeed(account) {
-  const maxRetries = 3;
+async function getUserId(username) {
+  if (userIdCache[username]) return userIdCache[username];
 
-  // Try primary URL
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const url = getFeedUrl(account, false);
-      console.log(`[RSS] Fetching ${url} (attempt ${attempt})`);
-      const feed = await parser.parseURL(url);
-      return feed;
-    } catch (err) {
-      console.error(`[RSS] Primary feed failed for @${account} (attempt ${attempt}): ${err.message}`);
-      if (attempt < maxRetries) {
-        const delay = Math.pow(2, attempt) * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
+  const data = await xApiRequest(`/2/users/by/username/${username}`);
+  if (data.data && data.data.id) {
+    userIdCache[username] = data.data.id;
+    return data.data.id;
   }
+  throw new Error(`User @${username} not found`);
+}
 
-  // Try fallback URL
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const url = getFeedUrl(account, true);
-      console.log(`[RSS] Trying fallback ${url} (attempt ${attempt})`);
-      const feed = await parser.parseURL(url);
-      return feed;
-    } catch (err) {
-      console.error(`[RSS] Fallback feed failed for @${account} (attempt ${attempt}): ${err.message}`);
-      if (attempt < maxRetries) {
-        const delay = Math.pow(2, attempt) * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  }
+/**
+ * Get recent tweets from a user
+ */
+async function getUserTweets(userId) {
+  const params = new URLSearchParams({
+    'max_results': '10',
+    'tweet.fields': 'created_at,text',
+  });
 
-  stats.errors++;
-  return null;
+  const data = await xApiRequest(`/2/users/${userId}/tweets?${params}`);
+  return data.data || [];
 }
 
 /**
@@ -80,45 +92,40 @@ async function checkAccount(account) {
     stats.perAccount[account] = { scanned: 0, alerts: 0 };
   }
 
-  const feed = await fetchFeed(account);
-  if (!feed || !feed.items) {
-    console.log(`[RSS] No feed data for @${account}`);
-    return;
-  }
+  try {
+    const userId = await getUserId(account);
+    const tweets = await getUserTweets(userId);
 
-  for (const item of feed.items) {
-    const postId = item.guid || item.link || item.title;
-    if (!postId) continue;
+    for (const tweet of tweets) {
+      const postId = tweet.id;
+      if (!postId) continue;
 
-    stats.scanned++;
-    stats.perAccount[account].scanned++;
+      stats.scanned++;
+      stats.perAccount[account].scanned++;
 
-    if (hasSeen(postId)) continue;
+      if (hasSeen(postId)) continue;
 
-    // Combine title and content for keyword matching
-    const fullText = [item.title, item.contentSnippet, item.content]
-      .filter(Boolean)
-      .join(' ');
+      const result = filterText(tweet.text);
 
-    const result = filterText(fullText);
+      if (result.matches) {
+        console.log(`[ALERT] Match found for @${account}: ${result.matched.join(', ')}`);
 
-    if (result.matches) {
-      console.log(`[ALERT] Match found for @${account}: ${result.matched.join(', ')}`);
+        await sendAlert({
+          account,
+          text: tweet.text,
+          link: `https://x.com/${account}/status/${tweet.id}`,
+          matched: result.matched,
+        });
 
-      const tweetLink = item.link || `https://x.com/${account}`;
+        stats.alerts++;
+        stats.perAccount[account].alerts++;
+      }
 
-      await sendAlert({
-        account,
-        text: item.contentSnippet || item.title || fullText,
-        link: tweetLink,
-        matched: result.matched,
-      });
-
-      stats.alerts++;
-      stats.perAccount[account].alerts++;
+      markSeen(postId);
     }
-
-    markSeen(postId);
+  } catch (err) {
+    console.error(`[X API] Error checking @${account}: ${err.message}`);
+    stats.errors++;
   }
 }
 
@@ -126,13 +133,13 @@ async function checkAccount(account) {
  * Run a full check cycle on all accounts
  */
 async function checkAll() {
-  console.log(`[RSS] Starting check cycle for ${config.accounts.length} accounts...`);
+  console.log(`[X API] Starting check cycle for ${config.accounts.length} accounts...`);
 
   for (const account of config.accounts) {
     try {
       await checkAccount(account);
     } catch (err) {
-      console.error(`[RSS] Error checking @${account}: ${err.message}`);
+      console.error(`[X API] Error checking @${account}: ${err.message}`);
       stats.errors++;
     }
   }
@@ -146,27 +153,20 @@ async function checkAll() {
     minute: '2-digit',
   });
 
-  console.log(`[RSS] Check cycle complete. Total scanned: ${stats.scanned}, Alerts: ${stats.alerts}`);
+  console.log(`[X API] Check cycle complete. Total scanned: ${stats.scanned}, Alerts: ${stats.alerts}`);
 }
 
 /**
- * Test RSS connectivity
+ * Test API connectivity
  */
 async function testConnectivity() {
   const results = {};
   for (const account of config.accounts) {
     try {
-      const url = getFeedUrl(account, false);
-      await parser.parseURL(url);
-      results[account] = 'OK (primary)';
-    } catch {
-      try {
-        const url = getFeedUrl(account, true);
-        await parser.parseURL(url);
-        results[account] = 'OK (fallback)';
-      } catch {
-        results[account] = 'FAILED';
-      }
+      const userId = await getUserId(account);
+      results[account] = `OK (ID: ${userId})`;
+    } catch (err) {
+      results[account] = `FAILED: ${err.message}`;
     }
   }
   return results;
