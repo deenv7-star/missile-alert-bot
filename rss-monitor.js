@@ -1,11 +1,9 @@
 const https = require('https');
-const http = require('http');
 const config = require('./config');
 const { filterText } = require('./keyword-filter');
 const { hasSeen, markSeen } = require('./dedup');
 const { sendAlert } = require('./telegram');
 
-// Stats tracking
 const stats = {
   scanned: 0,
   alerts: 0,
@@ -14,40 +12,37 @@ const stats = {
   perAccount: {},
 };
 
-// List of Nitter instances to try (with RSS support)
-const NITTER_INSTANCES = [
-  'https://xcancel.com',
-  'https://nitter.poast.org',
-  'https://nitter.privacyredirect.com',
-  'https://lightbrd.com',
-  'https://nitter.tiekoetter.com',
-  'https://nitter.catsarch.com',
-];
-
 /**
- * Fetch URL with browser-like headers
+ * Fetch a URL with browser-like headers
  */
 function fetchUrl(url) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
-    const client = urlObj.protocol === 'https:' ? https : http;
-
     const options = {
       hostname: urlObj.hostname,
       path: urlObj.pathname + urlObj.search,
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+        'Accept-Encoding': 'identity',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
       },
     };
 
-    const req = client.request(options, (res) => {
-      // Handle redirects
+    const req = https.request(options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        fetchUrl(res.headers.location).then(resolve).catch(reject);
+        let redirectUrl = res.headers.location;
+        if (redirectUrl.startsWith('/')) {
+          redirectUrl = `https://${urlObj.hostname}${redirectUrl}`;
+        }
+        fetchUrl(redirectUrl).then(resolve).catch(reject);
         return;
       }
 
@@ -63,7 +58,7 @@ function fetchUrl(url) {
     });
 
     req.on('error', reject);
-    req.setTimeout(15000, () => {
+    req.setTimeout(20000, () => {
       req.destroy();
       reject(new Error(`Timeout fetching ${urlObj.hostname}`));
     });
@@ -72,7 +67,51 @@ function fetchUrl(url) {
 }
 
 /**
- * Parse RSS XML manually (no external dependency needed)
+ * Scrape tweets from xcancel.com HTML page
+ */
+function parseTweetsFromHTML(html, account) {
+  const tweets = [];
+  
+  // Match tweet containers - xcancel uses timeline-item class
+  const tweetBlocks = html.split('class="timeline-item"');
+  
+  for (let i = 1; i < tweetBlocks.length; i++) {
+    const block = tweetBlocks[i];
+    
+    // Extract tweet text from tweet-content class
+    const contentMatch = block.match(/class="tweet-content[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+    const text = contentMatch 
+      ? contentMatch[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n\s+/g, '\n').trim()
+      : '';
+
+    // Extract tweet link
+    const linkMatch = block.match(/class="tweet-link"[^>]*href="([^"]+)"/);
+    const tweetPath = linkMatch ? linkMatch[1].trim() : '';
+    
+    // Also try to find status link
+    const statusMatch = block.match(/href="\/[^/]+\/status\/(\d+)/);
+    const tweetId = statusMatch ? statusMatch[1] : '';
+
+    if (text && tweetId) {
+      tweets.push({
+        text,
+        link: `https://x.com/${account}/status/${tweetId}`,
+        guid: tweetId,
+      });
+    } else if (text && tweetPath) {
+      tweets.push({
+        text,
+        link: `https://x.com${tweetPath}`,
+        guid: tweetPath,
+      });
+    }
+  }
+
+  return tweets;
+}
+
+/**
+ * Alternative: parse from Atom/RSS feed format
  */
 function parseRSS(xml) {
   const items = [];
@@ -85,16 +124,15 @@ function parseRSS(xml) {
     const link = extractTag(itemXml, 'link');
     const description = extractTag(itemXml, 'description');
     const guid = extractTag(itemXml, 'guid') || link;
-    const pubDate = extractTag(itemXml, 'pubDate');
 
-    // Clean HTML from description
     const cleanText = description
       ? description.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim()
       : title;
 
-    items.push({ title, link, text: cleanText, guid, pubDate });
+    if (cleanText) {
+      items.push({ text: cleanText, link, guid });
+    }
   }
-
   return items;
 }
 
@@ -106,33 +144,60 @@ function extractTag(xml, tag) {
 }
 
 /**
- * Try to fetch RSS feed from multiple Nitter instances
+ * Try multiple methods to get tweets
  */
-async function fetchFeed(account) {
-  for (const instance of NITTER_INSTANCES) {
-    try {
-      const url = `${instance}/${account}/rss`;
-      console.log(`[RSS] Trying ${url}`);
-      const xml = await fetchUrl(url);
-      
-      if (xml && xml.includes('<item>')) {
-        console.log(`[RSS] Success from ${instance} for @${account}`);
-        return parseRSS(xml);
-      } else {
-        console.log(`[RSS] No items from ${instance} for @${account}`);
+async function fetchTweets(account) {
+  const methods = [
+    // Method 1: xcancel HTML scraping
+    async () => {
+      console.log(`[SCRAPE] Trying xcancel.com HTML for @${account}`);
+      const html = await fetchUrl(`https://xcancel.com/${account}`);
+      const tweets = parseTweetsFromHTML(html, account);
+      if (tweets.length > 0) {
+        console.log(`[SCRAPE] Got ${tweets.length} tweets from xcancel.com for @${account}`);
+        return tweets;
       }
-    } catch (err) {
-      console.log(`[RSS] Failed ${instance} for @${account}: ${err.message}`);
-    }
-  }
+      throw new Error('No tweets found in HTML');
+    },
+    // Method 2: xcancel RSS
+    async () => {
+      console.log(`[RSS] Trying xcancel.com RSS for @${account}`);
+      const xml = await fetchUrl(`https://xcancel.com/${account}/rss`);
+      if (xml.includes('<item>')) {
+        const items = parseRSS(xml);
+        if (items.length > 0) {
+          console.log(`[RSS] Got ${items.length} items from xcancel.com RSS for @${account}`);
+          return items;
+        }
+      }
+      throw new Error('No RSS items');
+    },
+    // Method 3: nitter.poast.org HTML
+    async () => {
+      console.log(`[SCRAPE] Trying nitter.poast.org for @${account}`);
+      const html = await fetchUrl(`https://nitter.poast.org/${account}`);
+      const tweets = parseTweetsFromHTML(html, account);
+      if (tweets.length > 0) {
+        console.log(`[SCRAPE] Got ${tweets.length} tweets from nitter.poast.org for @${account}`);
+        return tweets;
+      }
+      throw new Error('No tweets found');
+    },
+    // Method 4: nitter.privacyredirect.com HTML
+    async () => {
+      console.log(`[SCRAPE] Trying nitter.privacyredirect.com for @${account}`);
+      const html = await fetchUrl(`https://nitter.privacyredirect.com/${account}`);
+      const tweets = parseTweetsFromHTML(html, account);
+      if (tweets.length > 0) return tweets;
+      throw new Error('No tweets found');
+    },
+  ];
 
-  // Fallback: try X API v2 if bearer token is available
-  if (config.twitter && config.twitter.bearerToken) {
+  for (const method of methods) {
     try {
-      console.log(`[X API] Trying X API v2 for @${account}`);
-      return await fetchFromXApi(account);
+      return await method();
     } catch (err) {
-      console.log(`[X API] Failed for @${account}: ${err.message}`);
+      console.log(`[MONITOR] ${err.message}`);
     }
   }
 
@@ -141,93 +206,21 @@ async function fetchFeed(account) {
 }
 
 /**
- * Fallback: Fetch from X API v2
- */
-function fetchFromXApi(account) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // First get user ID
-      const userData = await xApiRequest(`/2/users/by/username/${account}`);
-      if (!userData.data || !userData.data.id) {
-        reject(new Error(`User @${account} not found`));
-        return;
-      }
-      const userId = userData.data.id;
-
-      // Then get tweets
-      const params = new URLSearchParams({
-        'max_results': '10',
-        'tweet.fields': 'created_at,text',
-      });
-      const tweetData = await xApiRequest(`/2/users/${userId}/tweets?${params}`);
-      const tweets = (tweetData.data || []).map(t => ({
-        title: '',
-        link: `https://x.com/${account}/status/${t.id}`,
-        text: t.text,
-        guid: t.id,
-        pubDate: t.created_at,
-      }));
-      resolve(tweets);
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
-
-function xApiRequest(path) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'api.x.com',
-      path,
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${config.twitter.bearerToken}`,
-        'User-Agent': 'MissileAlertBot/1.0',
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (res.statusCode === 200) {
-            resolve(parsed);
-          } else {
-            reject(new Error(`X API ${res.statusCode}: ${parsed.detail || parsed.title || JSON.stringify(parsed)}`));
-          }
-        } catch (e) {
-          reject(new Error(`X API parse error: ${e.message}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(15000, () => {
-      req.destroy();
-      reject(new Error('X API request timeout'));
-    });
-    req.end();
-  });
-}
-
-/**
- * Check a single account for new missile-related posts
+ * Check a single account
  */
 async function checkAccount(account) {
   if (!stats.perAccount[account]) {
     stats.perAccount[account] = { scanned: 0, alerts: 0 };
   }
 
-  const items = await fetchFeed(account);
-  if (!items || items.length === 0) {
+  const tweets = await fetchTweets(account);
+  if (!tweets || tweets.length === 0) {
     console.log(`[MONITOR] No data for @${account}`);
     return;
   }
 
-  for (const item of items) {
-    const postId = item.guid || item.link;
+  for (const tweet of tweets) {
+    const postId = tweet.guid || tweet.link;
     if (!postId) continue;
 
     stats.scanned++;
@@ -235,16 +228,15 @@ async function checkAccount(account) {
 
     if (hasSeen(postId)) continue;
 
-    const fullText = [item.title, item.text].filter(Boolean).join(' ');
-    const result = filterText(fullText);
+    const result = filterText(tweet.text);
 
     if (result.matches) {
-      console.log(`[ALERT] Match found for @${account}: ${result.matched.join(', ')}`);
+      console.log(`[ALERT] Match for @${account}: ${result.matched.join(', ')}`);
 
       await sendAlert({
         account,
-        text: item.text || item.title || fullText,
-        link: item.link || `https://x.com/${account}`,
+        text: tweet.text,
+        link: tweet.link,
         matched: result.matched,
       });
 
@@ -256,9 +248,6 @@ async function checkAccount(account) {
   }
 }
 
-/**
- * Run a full check cycle on all accounts
- */
 async function checkAll() {
   console.log(`[MONITOR] Starting check cycle for ${config.accounts.length} accounts...`);
 
@@ -273,36 +262,23 @@ async function checkAll() {
 
   stats.lastCheck = new Date().toLocaleString('he-IL', {
     timeZone: config.timezone,
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
   });
 
-  console.log(`[MONITOR] Check cycle complete. Total scanned: ${stats.scanned}, Alerts: ${stats.alerts}`);
+  console.log(`[MONITOR] Check cycle complete. Scanned: ${stats.scanned}, Alerts: ${stats.alerts}`);
 }
 
-/**
- * Test connectivity
- */
 async function testConnectivity() {
   const results = {};
   for (const account of config.accounts) {
-    let found = false;
-    for (const instance of NITTER_INSTANCES) {
-      try {
-        const url = `${instance}/${account}/rss`;
-        const xml = await fetchUrl(url);
-        if (xml && xml.includes('<item>')) {
-          results[account] = `OK (${instance})`;
-          found = true;
-          break;
-        }
-      } catch {}
-    }
-    if (!found) {
-      results[account] = 'FAILED (all instances)';
+    try {
+      const tweets = await fetchTweets(account);
+      results[account] = tweets && tweets.length > 0 
+        ? `OK (${tweets.length} tweets)` 
+        : 'FAILED (no tweets)';
+    } catch (err) {
+      results[account] = `FAILED: ${err.message}`;
     }
   }
   return results;
