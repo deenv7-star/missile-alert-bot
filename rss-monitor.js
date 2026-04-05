@@ -12,8 +12,14 @@ const stats = {
   perAccount: {},
 };
 
+// RSS.app feed URLs mapped to accounts
+const RSS_FEEDS = {
+  'iranin_arabic': 'https://rss.app/feeds/21Dc0Q0dMINbGdRV.xml',
+  'urgent_iran': 'https://rss.app/feeds/unj1fQnsEnfyWr6K.xml',
+};
+
 /**
- * Fetch a URL with browser-like headers
+ * Fetch a URL
  */
 function fetchUrl(url) {
   return new Promise((resolve, reject) => {
@@ -24,25 +30,13 @@ function fetchUrl(url) {
       method: 'GET',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-        'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
       },
     };
 
     const req = https.request(options, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        let redirectUrl = res.headers.location;
-        if (redirectUrl.startsWith('/')) {
-          redirectUrl = `https://${urlObj.hostname}${redirectUrl}`;
-        }
-        fetchUrl(redirectUrl).then(resolve).catch(reject);
+        fetchUrl(res.headers.location).then(resolve).catch(reject);
         return;
       }
 
@@ -67,53 +61,9 @@ function fetchUrl(url) {
 }
 
 /**
- * Scrape tweets from xcancel.com HTML page
+ * Parse RSS XML
  */
-function parseTweetsFromHTML(html, account) {
-  const tweets = [];
-  
-  // Match tweet containers - xcancel uses timeline-item class
-  const tweetBlocks = html.split('class="timeline-item"');
-  
-  for (let i = 1; i < tweetBlocks.length; i++) {
-    const block = tweetBlocks[i];
-    
-    // Extract tweet text from tweet-content class
-    const contentMatch = block.match(/class="tweet-content[^"]*"[^>]*>([\s\S]*?)<\/div>/);
-    const text = contentMatch 
-      ? contentMatch[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n\s+/g, '\n').trim()
-      : '';
-
-    // Extract tweet link
-    const linkMatch = block.match(/class="tweet-link"[^>]*href="([^"]+)"/);
-    const tweetPath = linkMatch ? linkMatch[1].trim() : '';
-    
-    // Also try to find status link
-    const statusMatch = block.match(/href="\/[^/]+\/status\/(\d+)/);
-    const tweetId = statusMatch ? statusMatch[1] : '';
-
-    if (text && tweetId) {
-      tweets.push({
-        text,
-        link: `https://x.com/${account}/status/${tweetId}`,
-        guid: tweetId,
-      });
-    } else if (text && tweetPath) {
-      tweets.push({
-        text,
-        link: `https://x.com${tweetPath}`,
-        guid: tweetPath,
-      });
-    }
-  }
-
-  return tweets;
-}
-
-/**
- * Alternative: parse from Atom/RSS feed format
- */
-function parseRSS(xml) {
+function parseRSS(xml, account) {
   const items = [];
   const itemRegex = /<item>([\s\S]*?)<\/item>/g;
   let match;
@@ -125,84 +75,85 @@ function parseRSS(xml) {
     const description = extractTag(itemXml, 'description');
     const guid = extractTag(itemXml, 'guid') || link;
 
-    const cleanText = description
-      ? description.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim()
-      : title;
+    const cleanText = (description || title || '')
+      .replace(/<[^>]*>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, ' ')
+      .trim();
 
     if (cleanText) {
-      items.push({ text: cleanText, link, guid });
+      items.push({
+        text: cleanText,
+        link: link || `https://x.com/${account}`,
+        guid: guid || cleanText.substring(0, 50),
+      });
     }
   }
+
+  // Also try Atom format (entry instead of item)
+  if (items.length === 0) {
+    const entryRegex = /<entry>([\s\S]*?)<\/entry>/g;
+    while ((match = entryRegex.exec(xml)) !== null) {
+      const entryXml = match[1];
+      const title = extractTag(entryXml, 'title');
+      const linkMatch = entryXml.match(/<link[^>]*href="([^"]+)"/);
+      const link = linkMatch ? linkMatch[1] : '';
+      const content = extractTag(entryXml, 'content') || extractTag(entryXml, 'summary');
+      const id = extractTag(entryXml, 'id') || link;
+
+      const cleanText = (content || title || '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .trim();
+
+      if (cleanText) {
+        items.push({ text: cleanText, link, guid: id });
+      }
+    }
+  }
+
   return items;
 }
 
 function extractTag(xml, tag) {
-  const regex = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>|<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`);
+  const regex = new RegExp(
+    `<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>|<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`
+  );
   const match = regex.exec(xml);
   if (match) return (match[1] || match[2] || '').trim();
   return '';
 }
 
 /**
- * Try multiple methods to get tweets
+ * Fetch tweets for an account via RSS.app
  */
 async function fetchTweets(account) {
-  const methods = [
-    // Method 1: xcancel HTML scraping
-    async () => {
-      console.log(`[SCRAPE] Trying xcancel.com HTML for @${account}`);
-      const html = await fetchUrl(`https://xcancel.com/${account}`);
-      const tweets = parseTweetsFromHTML(html, account);
-      if (tweets.length > 0) {
-        console.log(`[SCRAPE] Got ${tweets.length} tweets from xcancel.com for @${account}`);
-        return tweets;
-      }
-      throw new Error('No tweets found in HTML');
-    },
-    // Method 2: xcancel RSS
-    async () => {
-      console.log(`[RSS] Trying xcancel.com RSS for @${account}`);
-      const xml = await fetchUrl(`https://xcancel.com/${account}/rss`);
-      if (xml.includes('<item>')) {
-        const items = parseRSS(xml);
-        if (items.length > 0) {
-          console.log(`[RSS] Got ${items.length} items from xcancel.com RSS for @${account}`);
-          return items;
-        }
-      }
-      throw new Error('No RSS items');
-    },
-    // Method 3: nitter.poast.org HTML
-    async () => {
-      console.log(`[SCRAPE] Trying nitter.poast.org for @${account}`);
-      const html = await fetchUrl(`https://nitter.poast.org/${account}`);
-      const tweets = parseTweetsFromHTML(html, account);
-      if (tweets.length > 0) {
-        console.log(`[SCRAPE] Got ${tweets.length} tweets from nitter.poast.org for @${account}`);
-        return tweets;
-      }
-      throw new Error('No tweets found');
-    },
-    // Method 4: nitter.privacyredirect.com HTML
-    async () => {
-      console.log(`[SCRAPE] Trying nitter.privacyredirect.com for @${account}`);
-      const html = await fetchUrl(`https://nitter.privacyredirect.com/${account}`);
-      const tweets = parseTweetsFromHTML(html, account);
-      if (tweets.length > 0) return tweets;
-      throw new Error('No tweets found');
-    },
-  ];
-
-  for (const method of methods) {
-    try {
-      return await method();
-    } catch (err) {
-      console.log(`[MONITOR] ${err.message}`);
-    }
+  const feedUrl = RSS_FEEDS[account];
+  if (!feedUrl) {
+    console.log(`[RSS] No feed URL configured for @${account}`);
+    return null;
   }
 
-  stats.errors++;
-  return null;
+  try {
+    console.log(`[RSS] Fetching ${feedUrl} for @${account}`);
+    const xml = await fetchUrl(feedUrl);
+    const items = parseRSS(xml, account);
+    console.log(`[RSS] Got ${items.length} items for @${account}`);
+    return items;
+  } catch (err) {
+    console.error(`[RSS] Error fetching @${account}: ${err.message}`);
+    stats.errors++;
+    return null;
+  }
 }
 
 /**
@@ -274,8 +225,8 @@ async function testConnectivity() {
   for (const account of config.accounts) {
     try {
       const tweets = await fetchTweets(account);
-      results[account] = tweets && tweets.length > 0 
-        ? `OK (${tweets.length} tweets)` 
+      results[account] = tweets && tweets.length > 0
+        ? `OK (${tweets.length} tweets)`
         : 'FAILED (no tweets)';
     } catch (err) {
       results[account] = `FAILED: ${err.message}`;
