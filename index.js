@@ -71,9 +71,10 @@ bot.onText(/\/test/, (msg) => {
   const { sendAlert } = require('./telegram');
   sendAlert({
     account: 'test_account',
-    text: 'זוהי התראת בדיקה 🧪\nThis is a test alert\nهذا تنبيه تجريبي',
+    text: 'عاجل 🚀 إيران تطلق صواريخ باليستية باتجاه إسرائيل\nBreaking: Iran launches ballistic missiles toward Israel',
     link: 'https://x.com/test',
-    matched: ['טיל', 'missile', 'صاروخ'],
+    matched: ['عاجل', 'صواريخ', 'باليستية', 'إطلاق', '🚀'],
+    priority: 'CRITICAL',
   });
 });
 

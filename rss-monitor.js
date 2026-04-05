@@ -182,13 +182,14 @@ async function checkAccount(account) {
     const result = filterText(tweet.text);
 
     if (result.matches) {
-      console.log(`[ALERT] Match for @${account}: ${result.matched.join(', ')}`);
+      console.log(`[ALERT] [${result.priority}] Match for @${account}: ${result.matched.join(', ')}`);
 
       await sendAlert({
         account,
         text: tweet.text,
         link: tweet.link,
         matched: result.matched,
+        priority: result.priority,
       });
 
       stats.alerts++;

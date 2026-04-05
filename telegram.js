@@ -1,16 +1,13 @@
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('./config');
+const { translateToHebrew } = require('./translator');
 
 const bot = new TelegramBot(config.telegram.token, { polling: true });
 const chatId = config.telegram.chatId;
 
-// Message queue for retry logic
 const messageQueue = [];
 let isProcessingQueue = false;
 
-/**
- * Escape special Markdown characters in user-generated text
- */
 function escapeMarkdown(text) {
   if (!text) return '';
   return text
@@ -23,8 +20,7 @@ function escapeMarkdown(text) {
 }
 
 /**
- * Send a message to the configured chat
- * Falls back to plain text if Markdown fails
+ * Send a message - falls back to plain text if Markdown fails
  */
 async function sendMessage(text, options = {}) {
   try {
@@ -35,7 +31,6 @@ async function sendMessage(text, options = {}) {
     });
   } catch (err) {
     console.error(`[TELEGRAM] Markdown send failed: ${err.message}`);
-    // Fallback: try without Markdown
     try {
       const plainText = text.replace(/\*/g, '').replace(/\\/g, '');
       await bot.sendMessage(chatId, plainText, {
@@ -50,7 +45,7 @@ async function sendMessage(text, options = {}) {
 }
 
 /**
- * Send a missile alert
+ * Send a missile alert with Hebrew translation
  */
 async function sendAlert(alert) {
   const timestamp = new Date().toLocaleString('he-IL', {
@@ -63,30 +58,55 @@ async function sendAlert(alert) {
     second: '2-digit',
   });
 
-  const keywordList = alert.matched.map(k => k).join(', ');
+  // Translate the tweet text to Hebrew
+  let translatedText = '';
+  try {
+    translatedText = await translateToHebrew(alert.text);
+  } catch (err) {
+    console.error(`[TRANSLATE] Failed: ${err.message}`);
+    translatedText = '';
+  }
+
+  const keywordList = alert.matched.join(', ');
   const safeText = escapeMarkdown(alert.text);
-  const safeAccount = escapeMarkdown(alert.account);
+  const safeTranslation = escapeMarkdown(translatedText);
 
-  const message = [
-    '🚀 *התראת טילים / Missile Alert*',
+  // Priority header
+  let header;
+  if (alert.priority === 'CRITICAL') {
+    header = '🔴🔴🔴 *שיגור / LAUNCH DETECTED* 🔴🔴🔴';
+  } else if (alert.priority === 'HIGH') {
+    header = '🟠 *התראה גבוהה / HIGH ALERT*';
+  } else {
+    header = '🚨 *התראת טילים / Missile Alert*';
+  }
+
+  const lines = [
+    header,
     '',
-    `📡 מקור: @${safeAccount}`,
+    `📡 מקור: @${alert.account}`,
     `🕐 זמן: ${timestamp}`,
+    `⚡ עדיפות: ${alert.priority}`,
     '',
-    '📝 תוכן:',
+    '📝 מקור:',
     safeText,
-    '',
-    `🔑 מילות מפתח: ${keywordList}`,
-    '',
-    `🔗 ${alert.link}`,
-  ].join('\n');
+  ];
 
-  await sendMessage(message);
+  // Add translation if different from original
+  if (translatedText && translatedText !== alert.text) {
+    lines.push('');
+    lines.push('🇮🇱 תרגום לעברית:');
+    lines.push(safeTranslation);
+  }
+
+  lines.push('');
+  lines.push(`🔑 מילות מפתח: ${keywordList}`);
+  lines.push('');
+  lines.push(`🔗 ${alert.link}`);
+
+  await sendMessage(lines.join('\n'));
 }
 
-/**
- * Send startup message
- */
 async function sendStartup(accountCount, keywordCount) {
   const accounts = config.accounts.map(a => `@${a}`).join(', ');
   await sendMessage(
@@ -97,9 +117,6 @@ async function sendStartup(accountCount, keywordCount) {
   );
 }
 
-/**
- * Send heartbeat message
- */
 async function sendHeartbeat(stats) {
   await sendMessage(
     `💓 דופק יומי - הבוט פעיל\n\n` +
@@ -110,31 +127,22 @@ async function sendHeartbeat(stats) {
   );
 }
 
-/**
- * Process queued messages with retry
- */
 async function processQueue() {
   if (isProcessingQueue || messageQueue.length === 0) return;
   isProcessingQueue = true;
 
   while (messageQueue.length > 0) {
     const item = messageQueue[0];
-
     if (item.retries >= 3) {
       console.error('[TELEGRAM] Gave up on message after 3 retries');
       messageQueue.shift();
       continue;
     }
-
     try {
       const delay = Math.pow(2, item.retries) * 1000;
       await new Promise(resolve => setTimeout(resolve, delay));
-
       const plainText = item.text.replace(/\*/g, '').replace(/\\/g, '');
-      await bot.sendMessage(chatId, plainText, {
-        disable_web_page_preview: true,
-      });
-
+      await bot.sendMessage(chatId, plainText, { disable_web_page_preview: true });
       messageQueue.shift();
     } catch (err) {
       console.error(`[TELEGRAM] Retry ${item.retries + 1} failed: ${err.message}`);
