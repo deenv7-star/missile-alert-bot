@@ -16,7 +16,7 @@ const config = {
 // Validate required fields
 if (!config.telegram.token) throw new Error('TELEGRAM_BOT_TOKEN is required in .env');
 if (!config.telegram.chatId) throw new Error('TELEGRAM_CHAT_ID is required in .env');
-if (!config.twitter.bearerToken) throw new Error('X_BEARER_TOKEN is required in .env');
+if (!config.twitter.bearerToken) console.warn('[CONFIG] X_BEARER_TOKEN not set — X API fallback disabled');
 if (config.accounts.length === 0) throw new Error('TWITTER_ACCOUNTS is required in .env');
 
 module.exports = config;
